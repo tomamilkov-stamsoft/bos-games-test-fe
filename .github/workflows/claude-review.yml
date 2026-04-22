@@ -1,0 +1,99 @@
+name: Claude PR Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review PR with Claude
+    runs-on: [self-hosted, claude-review]
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.BUILD_MACHINE_TOKEN }}
+
+    steps:
+      - name: Set up temp directory
+        run: |
+          WORK_DIR="/tmp/claude-review-${{ github.run_id }}"
+          mkdir -p "$WORK_DIR"
+          echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
+      - name: Get PR context
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          if ! gh pr diff "$PR_NUMBER" --repo "$REPO" > "$WORK_DIR/pr.diff"; then
+            echo "Failed to fetch PR diff"
+            exit 1
+          fi
+          if ! gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body > "$WORK_DIR/pr_info.json"; then
+            echo "Failed to fetch PR info"
+            exit 1
+          fi
+          DIFF_LINES=$(wc -l < "$WORK_DIR/pr.diff" | tr -d ' ')
+          if [ "$DIFF_LINES" -eq 0 ]; then
+            echo "Empty diff — nothing to review."
+            exit 1
+          fi
+          echo "Diff: $DIFF_LINES lines"
+      - name: Unlock keychain
+        run: |
+          security unlock-keychain -p "${{ secrets.CI_KEYCHAIN_PASSWORD }}" ~/Library/Keychains/login.keychain-db
+      - name: Review with Claude
+        run: |
+          claude --dangerously-skip-permissions -p \
+            "/pr-review-toolkit:review-pr — Review the diff in $WORK_DIR/pr.diff with PR info in $WORK_DIR/pr_info.json" \
+            > "$WORK_DIR/review.md" 2>"$WORK_DIR/claude-stderr.log" \
+            || { echo "=== Claude failed ==="; echo "stderr:"; cat "$WORK_DIR/claude-stderr.log"; echo "stdout:"; cat "$WORK_DIR/review.md"; exit 1; }
+      - name: Post or update review comment
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          {
+            echo "## 🤖 Claude Code Review"
+            echo ""
+            cat "$WORK_DIR/review.md"
+            echo ""
+            echo "---"
+            echo "<sub>Automated review by Claude · [Workflow run]($RUN_URL)</sub>"
+          } > "$WORK_DIR/comment.md"
+          EXISTING_COMMENT_ID=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("## 🤖 Claude Code Review")) | .id' \
+            2>/dev/null | tail -1)
+          POSTED=false
+          if [ -n "$EXISTING_COMMENT_ID" ]; then
+            if gh api "repos/$REPO/issues/comments/$EXISTING_COMMENT_ID" \
+              -X PATCH \
+              -F "body=@$WORK_DIR/comment.md" > /dev/null 2>&1; then
+              echo "Updated existing comment $EXISTING_COMMENT_ID"
+              POSTED=true
+            else
+              echo "Failed to update comment $EXISTING_COMMENT_ID"
+            fi
+          fi
+          if [ "$POSTED" = false ]; then
+            if ! gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$WORK_DIR/comment.md"; then
+              echo "::error::Failed to post review comment. Review output:"
+              cat "$WORK_DIR/review.md"
+              exit 1
+            fi
+            echo "Created new comment"
+          fi
+      - name: Handle failure
+        if: failure()
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "⚠️ Claude review failed. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+      - name: Cleanup
+        if: always()
+        run: rm -rf "${WORK_DIR:-/tmp/claude-review-${{ github.run_id }}}"
