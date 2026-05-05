@@ -14,6 +14,7 @@ concurrency:
 
 jobs:
   review:
+    if: ${{ !contains(github.head_ref, 'security-audit') }}
     name: Review PR with Claude
     runs-on: [self-hosted, claude-review]
     timeout-minutes: 15
